@@ -18,17 +18,20 @@ use windows::{
     Win32::{
         Foundation::*,
         Graphics::Gdi::{GetObjectW, BITMAP},
-        System::Com::*,
-        System::Memory::*,
-        System::Ole::{DoDragDrop, OleInitialize},
-        System::Ole::{
-            IDropSource, IDropSource_Impl, CF_HDROP, DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_MOVE,
+        System::{
+            Com::*,
+            Memory::*,
+            Ole::{
+                DoDragDrop, IDropSource, IDropSource_Impl, OleInitialize, CF_HDROP, DROPEFFECT,
+                DROPEFFECT_COPY, DROPEFFECT_MOVE,
+            },
+            SystemServices::{MK_LBUTTON, MODIFIERKEYS_FLAGS},
         },
-        System::SystemServices::{MK_LBUTTON, MODIFIERKEYS_FLAGS},
         UI::{
             Shell::{
                 BHID_DataObject, CLSID_DragDropHelper, Common, IDragSourceHelper, IShellItemArray,
-                SHCreateDataObject, SHCreateShellItemArrayFromIDLists, DROPFILES, SHDRAGIMAGE,
+                SHCreateDataObject, SHCreateShellItemArrayFromIDLists, SHCreateStdEnumFmtEtc,
+                DROPFILES, SHDRAGIMAGE,
             },
             WindowsAndMessaging::GetCursorPos,
         },
@@ -191,7 +194,15 @@ impl IDataObject_Impl for DataObject {
     }
 
     fn EnumFormatEtc(&self, _dwdirection: u32) -> Result<IEnumFORMATETC> {
-        Err(Error::new(E_NOTIMPL, HSTRING::new()))
+        unsafe {
+            SHCreateStdEnumFmtEtc(&[FORMATETC {
+                cfFormat: CF_HDROP.0,
+                ptd: std::ptr::null_mut(),
+                dwAspect: DVASPECT_CONTENT.0,
+                lindex: 0,
+                tymed: TYMED_HGLOBAL.0 as u32,
+            }])
+        }
     }
 
     fn DAdvise(
@@ -230,12 +241,18 @@ pub fn start_drag<W: HasWindowHandle, F: Fn(DragResult, CursorPosition) + Send +
                     }
                 }
 
+                // Convert to absolute paths. Note we do _not_ use canonicalize here, because the
+                // shell doesn't understand UNC paths. Even dunce::canonicalize doesn't work,
+                // because it still returns UNC paths for network locations.
                 let mut paths = Vec::new();
                 for f in files {
-                    paths.push(dunce::canonicalize(f)?);
+                    paths.push(std::path::absolute(f)?);
                 }
 
-                let data_object: IDataObject = get_file_data_object(&paths).unwrap();
+                // If the shell item functions fail, fall back to a custom data object using HDROP.
+                // This mainly applies when using network paths.
+                let data_object: IDataObject =
+                    get_file_data_object(&paths).unwrap_or_else(|_| DataObject::new(paths).into());
                 let drop_source: IDropSource = DropSource::new().into();
 
                 unsafe {
@@ -365,20 +382,20 @@ pub fn create_instance<T: Interface + ComInterface>(clsid: &GUID) -> Result<T> {
     unsafe { CoCreateInstance(clsid, None, CLSCTX_ALL) }
 }
 
-fn get_file_data_object(paths: &[PathBuf]) -> Option<IDataObject> {
+fn get_file_data_object(paths: &[PathBuf]) -> Result<IDataObject> {
     unsafe {
-        let shell_item_array = get_shell_item_array(paths).unwrap();
-        shell_item_array.BindToHandler(None, &BHID_DataObject).ok()
+        let shell_item_array = get_shell_item_array(paths)?;
+        shell_item_array.BindToHandler(None, &BHID_DataObject)
     }
 }
 
-fn get_shell_item_array(paths: &[PathBuf]) -> Option<IShellItemArray> {
+fn get_shell_item_array(paths: &[PathBuf]) -> Result<IShellItemArray> {
     unsafe {
         let list: Vec<*const Common::ITEMIDLIST> = paths
             .iter()
             .map(|path| get_file_item_id(path).cast_const())
             .collect();
-        SHCreateShellItemArrayFromIDLists(&list).ok()
+        SHCreateShellItemArrayFromIDLists(&list)
     }
 }
 
