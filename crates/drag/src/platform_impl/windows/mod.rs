@@ -337,13 +337,14 @@ pub fn start_drag<W: HasWindowHandle, F: Fn(DragResult, CursorPosition) + Send +
                     .or_else(|| {
                         // dunce converts network locations to UNC paths that ILCreateFromPathW
                         // can't understand, even if it would have been able to parse the original
-                        // version. So try path::absolute instea
+                        // version. So try path::absolute instead.
                         let mut paths = Vec::new();
                         for f in path_bufs {
                             paths.push(std::path::absolute(f).ok()?);
                         }
                         get_file_data_object(&paths)
                     })
+                    // As a last resort, use the HDROP format instead of shell items.
                     .unwrap_or_else(|| DataObject::new(item).into())
             }
             DragItem::Data { .. } => DataObject::new(item).into(),
