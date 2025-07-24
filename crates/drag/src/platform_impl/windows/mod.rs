@@ -103,16 +103,6 @@ impl DataObject {
         }
     }
 
-    fn is_supported_format(pformatetc: *const FORMATETC) -> bool {
-        if let Some(format_etc) = unsafe { pformatetc.as_ref() } {
-            !(format_etc.tymed as i32 != TYMED_HGLOBAL.0
-                || format_etc.cfFormat != CF_HDROP.0
-                || format_etc.dwAspect != DVASPECT_CONTENT.0)
-        } else {
-            false
-        }
-    }
-
     fn is_global_content(pformatetc: *const FORMATETC) -> bool {
         if let Some(format_etc) = unsafe { pformatetc.as_ref() } {
             // API documentation all suggests tymed should be exact, but in reality Explorer uses
@@ -229,13 +219,25 @@ impl IDataObject_Impl for DataObject {
     }
 
     fn QueryGetData(&self, pformatetc: *const FORMATETC) -> HRESULT {
-        unsafe {
-            if Self::is_supported_format(pformatetc) {
-                S_OK
-            } else {
-                self.inner_shell_obj.QueryGetData(pformatetc)
+        if Self::is_global_content(pformatetc) {
+            if let Some(format) = unsafe { pformatetc.as_ref() } {
+                match self.item {
+                    DragItem::Files(_) => {
+                        if format.cfFormat == CF_HDROP.0 {
+                            return S_OK;
+                        }
+                    }
+                    DragItem::Data { .. } => {
+                        if format.cfFormat == self.content_format
+                            || format.cfFormat == self.descriptor_format
+                        {
+                            return S_OK;
+                        }
+                    }
+                }
             }
         }
+        unsafe { self.inner_shell_obj.QueryGetData(pformatetc) }
     }
 
     fn GetCanonicalFormatEtc(
