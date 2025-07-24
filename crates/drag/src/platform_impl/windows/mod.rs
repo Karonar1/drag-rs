@@ -326,18 +326,25 @@ pub fn start_drag<W: HasWindowHandle, F: Fn(DragResult, CursorPosition) + Send +
 
         let data_object: IDataObject = match &item {
             DragItem::Files(path_bufs) => {
-                // Convert to absolute paths. Note we do _not_ use canonicalize here, because the
-                // shell doesn't understand UNC paths. Even dunce::canonicalize doesn't work,
-                // because it still returns UNC paths for network locations.
+                // Convert to absolute paths. ILCreateFromPathW doesn't understand UNC paths, so we
+                // either need to use dunce::canonicalize or std::path::absolute. dunce resolves
+                // links, junction points, etc. so is generally preferred.
                 let mut paths = Vec::new();
                 for f in path_bufs {
-                    paths.push(std::path::absolute(f)?);
+                    paths.push(dunce::canonicalize(f)?);
                 }
-
-                // If the shell item functions fail, fall back to a custom data object using HDROP.
-                // This mainly applies when using network paths.
-
-                get_file_data_object(&paths).unwrap_or_else(|_| DataObject::new(item).into())
+                get_file_data_object(&paths)
+                    .or_else(|| {
+                        // dunce converts network locations to UNC paths that ILCreateFromPathW
+                        // can't understand, even if it would have been able to parse the original
+                        // version. So try path::absolute instea
+                        let mut paths = Vec::new();
+                        for f in path_bufs {
+                            paths.push(std::path::absolute(f).ok()?);
+                        }
+                        get_file_data_object(&paths)
+                    })
+                    .unwrap_or_else(|| DataObject::new(item).into())
             }
             DragItem::Data { .. } => DataObject::new(item).into(),
         };
@@ -425,10 +432,10 @@ pub fn create_instance<T: Interface + ComInterface>(clsid: &GUID) -> Result<T> {
     unsafe { CoCreateInstance(clsid, None, CLSCTX_ALL) }
 }
 
-fn get_file_data_object(paths: &[PathBuf]) -> Result<IDataObject> {
+fn get_file_data_object(paths: &[PathBuf]) -> Option<IDataObject> {
     unsafe {
-        let shell_item_array = get_shell_item_array(paths)?;
-        shell_item_array.BindToHandler(None, &BHID_DataObject)
+        let shell_item_array = get_shell_item_array(paths).ok()?;
+        shell_item_array.BindToHandler(None, &BHID_DataObject).ok()
     }
 }
 
