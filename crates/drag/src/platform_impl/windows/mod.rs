@@ -11,6 +11,7 @@ use std::{
     iter::once,
     os::windows::ffi::OsStrExt,
     path::{Path, PathBuf},
+    ptr::addr_of,
     sync::Once,
 };
 use windows::{
@@ -20,6 +21,7 @@ use windows::{
         Graphics::Gdi::{GetObjectW, BITMAP},
         System::{
             Com::*,
+            DataExchange::RegisterClipboardFormatW,
             Memory::*,
             Ole::{
                 DoDragDrop, IDropSource, IDropSource_Impl, OleInitialize, CF_HDROP, DROPEFFECT,
@@ -31,7 +33,8 @@ use windows::{
             Shell::{
                 BHID_DataObject, CLSID_DragDropHelper, Common, IDragSourceHelper, IShellItemArray,
                 SHCreateDataObject, SHCreateShellItemArrayFromIDLists, SHCreateStdEnumFmtEtc,
-                DROPFILES, SHDRAGIMAGE,
+                CFSTR_FILECONTENTS, CFSTR_FILEDESCRIPTORW, DROPFILES, FD_UNICODE, FILEDESCRIPTORW,
+                FILEGROUPDESCRIPTORW, SHDRAGIMAGE,
             },
             WindowsAndMessaging::GetCursorPos,
         },
@@ -54,15 +57,14 @@ fn init_ole() {
 
 #[implement(IDataObject)]
 struct DataObject {
-    files: Vec<PathBuf>,
+    item: DragItem,
     inner_shell_obj: IDataObject,
+    content_format: u16,
+    descriptor_format: u16,
 }
 
 #[implement(IDropSource)]
 struct DropSource(());
-
-#[implement(IDropSource)]
-struct DummyDropSource(());
 
 impl DropSource {
     fn new() -> Self {
@@ -87,35 +89,16 @@ impl IDropSource_Impl for DropSource {
     }
 }
 
-impl DummyDropSource {
-    fn new() -> Self {
-        Self(())
-    }
-}
-
-#[allow(non_snake_case)]
-impl IDropSource_Impl for DummyDropSource {
-    fn QueryContinueDrag(&self, fescapepressed: BOOL, grfkeystate: MODIFIERKEYS_FLAGS) -> HRESULT {
-        if fescapepressed.as_bool() || (grfkeystate & MK_LBUTTON) == MODIFIERKEYS_FLAGS(0) {
-            DRAGDROP_S_CANCEL
-        } else {
-            S_OK
-        }
-    }
-
-    fn GiveFeedback(&self, _dweffect: DROPEFFECT) -> HRESULT {
-        DRAGDROP_S_USEDEFAULTCURSORS
-    }
-}
-
 impl DataObject {
     // This will be used for sharing text between applications
     #[allow(dead_code)]
-    fn new(files: Vec<PathBuf>) -> Self {
+    fn new(item: DragItem) -> Self {
         unsafe {
             Self {
-                files,
+                item,
                 inner_shell_obj: SHCreateDataObject(None, None, None).unwrap(),
+                content_format: RegisterClipboardFormatW(CFSTR_FILECONTENTS) as u16,
+                descriptor_format: RegisterClipboardFormatW(CFSTR_FILEDESCRIPTORW) as u16,
             }
         }
     }
@@ -130,10 +113,26 @@ impl DataObject {
         }
     }
 
-    fn clone_drop_hglobal(&self) -> Result<HGLOBAL> {
+    fn is_global_content(pformatetc: *const FORMATETC) -> bool {
+        if let Some(format_etc) = unsafe { pformatetc.as_ref() } {
+            // API documentation all suggests tymed should be exact, but in reality Explorer uses
+            // it as a bitfield when requesting data.
+            (format_etc.tymed as i32 & TYMED_HGLOBAL.0) > 0
+                && format_etc.dwAspect == DVASPECT_CONTENT.0
+        } else {
+            false
+        }
+    }
+
+    fn hdrop_data(files: &[PathBuf]) -> Result<HGLOBAL> {
         let mut buffer = Vec::new();
-        for path in &self.files {
-            let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(once(0)).collect();
+        for path in files {
+            let wide_path: Vec<u16> = std::path::absolute(path)
+                .unwrap()
+                .as_os_str()
+                .encode_wide()
+                .chain(once(0))
+                .collect();
             buffer.extend(wide_path);
         }
         buffer.push(0);
@@ -146,19 +145,83 @@ impl DataObject {
 #[allow(non_snake_case)]
 impl IDataObject_Impl for DataObject {
     fn GetData(&self, pformatetc: *const FORMATETC) -> Result<STGMEDIUM> {
-        unsafe {
-            if Self::is_supported_format(pformatetc) {
-                Ok(STGMEDIUM {
-                    tymed: TYMED_HGLOBAL.0 as u32,
-                    u: STGMEDIUM_0 {
-                        hGlobal: self.clone_drop_hglobal()?,
-                    },
-                    pUnkForRelease: std::mem::ManuallyDrop::new(None),
-                })
-            } else {
-                self.inner_shell_obj.GetData(pformatetc)
+        if let Some(format) = unsafe { pformatetc.as_ref() } {
+            if Self::is_global_content(pformatetc) {
+                match &self.item {
+                    DragItem::Files(path_bufs) => {
+                        if format.cfFormat == CF_HDROP.0 {
+                            return Ok(STGMEDIUM {
+                                tymed: TYMED_HGLOBAL.0 as u32,
+                                u: STGMEDIUM_0 {
+                                    hGlobal: Self::hdrop_data(path_bufs)?,
+                                },
+                                pUnkForRelease: std::mem::ManuallyDrop::new(None),
+                            });
+                        }
+                    }
+                    DragItem::Data { provider, types } => {
+                        if format.cfFormat == self.content_format {
+                            if let Some(data) = provider(&types[format.lindex as usize]) {
+                                unsafe {
+                                    let handle = GlobalAlloc(GMEM_FIXED, data.len()).unwrap();
+                                    let ptr = GlobalLock(handle);
+                                    std::ptr::copy(data.as_ptr() as *const c_void, ptr, data.len());
+                                    GlobalUnlock(handle).unwrap();
+                                    return Ok(STGMEDIUM {
+                                        tymed: TYMED_HGLOBAL.0 as u32,
+                                        u: STGMEDIUM_0 { hGlobal: handle },
+                                        pUnkForRelease: std::mem::ManuallyDrop::new(None),
+                                    });
+                                }
+                            }
+                        } else if format.cfFormat == self.descriptor_format {
+                            let size = size_of::<FILEGROUPDESCRIPTORW>()
+                                + size_of::<FILEDESCRIPTORW>() * (types.len() - 1);
+                            unsafe {
+                                let handle = GlobalAlloc(GMEM_FIXED, size).unwrap();
+                                let ptr = GlobalLock(handle);
+
+                                let group_descriptor = ptr as *mut FILEGROUPDESCRIPTORW;
+                                (*group_descriptor).cItems = types.len() as u32;
+
+                                let mut descriptor = (*group_descriptor).fgd.as_mut_ptr();
+
+                                for path in types {
+                                    (*descriptor).dwFlags = FD_UNICODE.0 as u32;
+
+                                    let mut buffer = Vec::new();
+                                    let wide_path: Vec<u16> = std::path::absolute(path)
+                                        .unwrap()
+                                        .as_os_str()
+                                        .encode_wide()
+                                        .chain(once(0))
+                                        .collect();
+                                    buffer.extend(wide_path);
+                                    buffer.push(0);
+
+                                    assert!(buffer.len() <= 260);
+                                    std::ptr::copy(
+                                        buffer.as_ptr(),
+                                        addr_of!((*descriptor).cFileName) as *mut u16,
+                                        buffer.len(),
+                                    );
+
+                                    descriptor = descriptor.add(1);
+                                }
+                                GlobalUnlock(handle).unwrap();
+
+                                return Ok(STGMEDIUM {
+                                    tymed: TYMED_HGLOBAL.0 as u32,
+                                    u: STGMEDIUM_0 { hGlobal: handle },
+                                    pUnkForRelease: std::mem::ManuallyDrop::new(None),
+                                });
+                            }
+                        }
+                    }
+                }
             }
         }
+        unsafe { self.inner_shell_obj.GetData(pformatetc) }
     }
 
     fn GetDataHere(&self, _pformatetc: *const FORMATETC, _pmedium: *mut STGMEDIUM) -> Result<()> {
@@ -194,14 +257,34 @@ impl IDataObject_Impl for DataObject {
     }
 
     fn EnumFormatEtc(&self, _dwdirection: u32) -> Result<IEnumFORMATETC> {
-        unsafe {
-            SHCreateStdEnumFmtEtc(&[FORMATETC {
-                cfFormat: CF_HDROP.0,
-                ptd: std::ptr::null_mut(),
-                dwAspect: DVASPECT_CONTENT.0,
-                lindex: 0,
-                tymed: TYMED_HGLOBAL.0 as u32,
-            }])
+        match &self.item {
+            DragItem::Files(_) => unsafe {
+                SHCreateStdEnumFmtEtc(&[FORMATETC {
+                    cfFormat: CF_HDROP.0,
+                    ptd: std::ptr::null_mut(),
+                    dwAspect: DVASPECT_CONTENT.0,
+                    lindex: 0,
+                    tymed: TYMED_HGLOBAL.0 as u32,
+                }])
+            },
+            DragItem::Data { .. } => unsafe {
+                SHCreateStdEnumFmtEtc(&[
+                    FORMATETC {
+                        cfFormat: self.content_format,
+                        ptd: std::ptr::null_mut(),
+                        dwAspect: DVASPECT_CONTENT.0,
+                        lindex: 0,
+                        tymed: TYMED_HGLOBAL.0 as u32,
+                    },
+                    FORMATETC {
+                        cfFormat: self.descriptor_format,
+                        ptd: std::ptr::null_mut(),
+                        dwAspect: DVASPECT_CONTENT.0,
+                        lindex: 0,
+                        tymed: TYMED_HGLOBAL.0 as u32,
+                    },
+                ])
+            },
         }
     }
 
@@ -231,96 +314,54 @@ pub fn start_drag<W: HasWindowHandle, F: Fn(DragResult, CursorPosition) + Send +
     options: Options,
 ) -> crate::Result<()> {
     if let Ok(RawWindowHandle::Win32(_w)) = handle.window_handle().map(|h| h.as_raw()) {
-        match item {
-            DragItem::Files(files) => {
-                init_ole();
-                unsafe {
-                    #[allow(static_mut_refs)]
-                    if let Err(e) = &OLE_RESULT {
-                        return Err(e.clone().into());
-                    }
-                }
+        init_ole();
+        unsafe {
+            #[allow(static_mut_refs)]
+            if let Err(e) = &OLE_RESULT {
+                return Err(e.clone().into());
+            }
+        }
 
+        let data_object: IDataObject = match &item {
+            DragItem::Files(path_bufs) => {
                 // Convert to absolute paths. Note we do _not_ use canonicalize here, because the
                 // shell doesn't understand UNC paths. Even dunce::canonicalize doesn't work,
                 // because it still returns UNC paths for network locations.
                 let mut paths = Vec::new();
-                for f in files {
+                for f in path_bufs {
                     paths.push(std::path::absolute(f)?);
                 }
 
                 // If the shell item functions fail, fall back to a custom data object using HDROP.
                 // This mainly applies when using network paths.
-                let data_object: IDataObject =
-                    get_file_data_object(&paths).unwrap_or_else(|_| DataObject::new(paths).into());
-                let drop_source: IDropSource = DropSource::new().into();
 
-                unsafe {
-                    if let Some(drag_image) = get_drag_image(image) {
-                        if let Ok(helper) =
-                            create_instance::<IDragSourceHelper>(&CLSID_DragDropHelper)
-                        {
-                            let _ = helper.InitializeFromBitmap(&drag_image, &data_object);
-                        }
-                    }
+                get_file_data_object(&paths).unwrap_or_else(|_| DataObject::new(item).into())
+            }
+            DragItem::Data { .. } => DataObject::new(item).into(),
+        };
+        let drop_source: IDropSource = DropSource::new().into();
 
-                    let mut out_dropeffect = DROPEFFECT::default();
-                    let effect = match options.mode {
-                        DragMode::Copy => DROPEFFECT_COPY,
-                        DragMode::Move => DROPEFFECT_MOVE,
-                    };
-
-                    let drop_result =
-                        DoDragDrop(&data_object, &drop_source, effect, &mut out_dropeffect);
-                    let mut pt = POINT { x: 0, y: 0 };
-                    GetCursorPos(&mut pt)?;
-                    if drop_result == DRAGDROP_S_DROP {
-                        on_drop_callback(DragResult::Dropped, CursorPosition { x: pt.x, y: pt.y });
-                    } else {
-                        // DRAGDROP_S_CANCEL
-                        on_drop_callback(DragResult::Cancel, CursorPosition { x: pt.x, y: pt.y });
-                    }
+        unsafe {
+            if let Some(drag_image) = get_drag_image(image) {
+                if let Ok(helper) = create_instance::<IDragSourceHelper>(&CLSID_DragDropHelper) {
+                    let _ = helper.InitializeFromBitmap(&drag_image, &data_object);
                 }
             }
-            DragItem::Data { .. } => {
-                init_ole();
-                unsafe {
-                    #[allow(static_mut_refs)]
-                    if let Err(e) = &OLE_RESULT {
-                        return Err(e.clone().into());
-                    }
-                }
 
-                let paths = vec![dunce::canonicalize("./")?];
+            let mut out_dropeffect = DROPEFFECT::default();
+            let effect = match options.mode {
+                DragMode::Copy => DROPEFFECT_COPY,
+                DragMode::Move => DROPEFFECT_MOVE,
+            };
 
-                let data_object: IDataObject = get_file_data_object(&paths).unwrap();
-                let drop_source: IDropSource = DummyDropSource::new().into();
-
-                unsafe {
-                    if let Some(drag_image) = get_drag_image(image) {
-                        if let Ok(helper) =
-                            create_instance::<IDragSourceHelper>(&CLSID_DragDropHelper)
-                        {
-                            let _ = helper.InitializeFromBitmap(&drag_image, &data_object);
-                        }
-                    }
-
-                    let mut out_dropeffect = DROPEFFECT::default();
-                    let drop_result = DoDragDrop(
-                        &data_object,
-                        &drop_source,
-                        DROPEFFECT_COPY,
-                        &mut out_dropeffect,
-                    );
-                    let mut pt = POINT { x: 0, y: 0 };
-                    GetCursorPos(&mut pt)?;
-                    if drop_result == DRAGDROP_S_DROP {
-                        on_drop_callback(DragResult::Dropped, CursorPosition { x: pt.x, y: pt.y });
-                    } else {
-                        // DRAGDROP_S_CANCEL
-                        on_drop_callback(DragResult::Cancel, CursorPosition { x: pt.x, y: pt.y });
-                    }
-                }
+            let drop_result = DoDragDrop(&data_object, &drop_source, effect, &mut out_dropeffect);
+            let mut pt = POINT { x: 0, y: 0 };
+            GetCursorPos(&mut pt)?;
+            if drop_result == DRAGDROP_S_DROP {
+                on_drop_callback(DragResult::Dropped, CursorPosition { x: pt.x, y: pt.y });
+            } else {
+                // DRAGDROP_S_CANCEL
+                on_drop_callback(DragResult::Cancel, CursorPosition { x: pt.x, y: pt.y });
             }
         }
         Ok(())
