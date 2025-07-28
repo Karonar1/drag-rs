@@ -73,7 +73,7 @@ impl DropSource {
 }
 
 #[allow(non_snake_case)]
-impl IDropSource_Impl for DropSource {
+impl IDropSource_Impl for DropSource_Impl {
     fn QueryContinueDrag(&self, fescapepressed: BOOL, grfkeystate: MODIFIERKEYS_FLAGS) -> HRESULT {
         if fescapepressed.as_bool() {
             DRAGDROP_S_CANCEL
@@ -133,17 +133,17 @@ impl DataObject {
 }
 
 #[allow(non_snake_case)]
-impl IDataObject_Impl for DataObject {
+impl IDataObject_Impl for DataObject_Impl {
     fn GetData(&self, pformatetc: *const FORMATETC) -> Result<STGMEDIUM> {
         if let Some(format) = unsafe { pformatetc.as_ref() } {
-            if Self::is_global_content(pformatetc) {
+            if DataObject::is_global_content(pformatetc) {
                 match &self.item {
                     DragItem::Files(path_bufs) => {
                         if format.cfFormat == CF_HDROP.0 {
                             return Ok(STGMEDIUM {
                                 tymed: TYMED_HGLOBAL.0 as u32,
                                 u: STGMEDIUM_0 {
-                                    hGlobal: Self::hdrop_data(path_bufs)?,
+                                    hGlobal: DataObject::hdrop_data(path_bufs)?,
                                 },
                                 pUnkForRelease: std::mem::ManuallyDrop::new(None),
                             });
@@ -215,11 +215,11 @@ impl IDataObject_Impl for DataObject {
     }
 
     fn GetDataHere(&self, _pformatetc: *const FORMATETC, _pmedium: *mut STGMEDIUM) -> Result<()> {
-        Err(Error::new(DV_E_FORMATETC, HSTRING::new()))
+        Err(Error::new(DV_E_FORMATETC, ""))
     }
 
     fn QueryGetData(&self, pformatetc: *const FORMATETC) -> HRESULT {
-        if Self::is_global_content(pformatetc) {
+        if DataObject::is_global_content(pformatetc) {
             if let Some(format) = unsafe { pformatetc.as_ref() } {
                 match self.item {
                     DragItem::Files(_) => {
@@ -255,7 +255,10 @@ impl IDataObject_Impl for DataObject {
         pmedium: *const STGMEDIUM,
         frelease: BOOL,
     ) -> Result<()> {
-        unsafe { self.inner_shell_obj.SetData(pformatetc, pmedium, frelease) }
+        unsafe {
+            self.inner_shell_obj
+                .SetData(pformatetc, pmedium, frelease.into())
+        }
     }
 
     fn EnumFormatEtc(&self, _dwdirection: u32) -> Result<IEnumFORMATETC> {
@@ -294,17 +297,17 @@ impl IDataObject_Impl for DataObject {
         &self,
         _pformatetc: *const FORMATETC,
         _advf: u32,
-        _padvsink: Option<&IAdviseSink>,
+        _padvsink: windows_core::Ref<'_, IAdviseSink>,
     ) -> Result<u32> {
-        Err(Error::new(OLE_E_ADVISENOTSUPPORTED, HSTRING::new()))
+        Err(Error::new(OLE_E_ADVISENOTSUPPORTED, ""))
     }
 
     fn DUnadvise(&self, _dwconnection: u32) -> Result<()> {
-        Err(Error::new(OLE_E_ADVISENOTSUPPORTED, HSTRING::new()))
+        Err(Error::new(OLE_E_ADVISENOTSUPPORTED, ""))
     }
 
     fn EnumDAdvise(&self) -> Result<IEnumSTATDATA> {
-        Err(Error::new(OLE_E_ADVISENOTSUPPORTED, HSTRING::new()))
+        Err(Error::new(OLE_E_ADVISENOTSUPPORTED, ""))
     }
 }
 
@@ -390,7 +393,7 @@ fn get_drag_image(image: Image) -> Option<SHDRAGIMAGE> {
         let mut bitmap: BITMAP = BITMAP::default();
         let (width, height) = if 0
             == GetObjectW(
-                hbitmap,
+                hbitmap.into(),
                 std::mem::size_of::<BITMAP>() as i32,
                 Some(&mut bitmap as *mut BITMAP as *mut c_void),
             ) {
@@ -429,7 +432,7 @@ fn get_hglobal(size: usize, buffer: Vec<u16>) -> Result<HGLOBAL> {
     Ok(handle)
 }
 
-pub fn create_instance<T: Interface + ComInterface>(clsid: &GUID) -> Result<T> {
+pub fn create_instance<T: Interface>(clsid: &GUID) -> Result<T> {
     unsafe { CoCreateInstance(clsid, None, CLSCTX_ALL) }
 }
 
